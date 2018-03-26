@@ -1,0 +1,4 @@
+MNIST_data
+.ipynb_checkpoints
+model
+cifar-10-batches-py

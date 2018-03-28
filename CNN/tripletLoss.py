@@ -1,3 +1,6 @@
+"""
+Adapted from https://github.com/VisualComputingInstitute/triplet-reid/blob/master/loss.py
+"""
 import numbers
 import tensorflow as tf
 
@@ -148,8 +151,10 @@ def batch_hard(dists, pids, margin, batch_precision_at_k=None):
 
         return diff, top1, prec_at_k, topk_is_same, negative_dists, positive_dists
     
-def batch_hard_loc(dists, pids, margin, batch_precision_at_k=None):
-    """Computes the batch-hard loss from arxiv.org/abs/1703.07737.
+def normalTriplet(dists, pids, margin, batch_precision_at_k=None):
+    """
+    Author: lochappy <ttanloc@gmail.com>
+    Computes the normal triplet loss between positive and negative pairs
 
     Args:
         dists (2D tensor): A square all-to-all distance matrix as given by cdist.
@@ -162,7 +167,7 @@ def batch_hard_loc(dists, pids, margin, batch_precision_at_k=None):
     Returns:
         A 1D tensor of shape (B,) containing the loss value for each sample.
     """
-    with tf.name_scope("batch_hard_loc"):
+    with tf.name_scope("normalTriplet"):
         same_identity_mask = tf.equal(tf.expand_dims(pids, axis=1),
                                       tf.expand_dims(pids, axis=0))
         negative_mask = tf.logical_not(same_identity_mask)
@@ -175,9 +180,20 @@ def batch_hard_loc(dists, pids, margin, batch_precision_at_k=None):
             x[2].set_shape([None])
             pos_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[1]),axis=1)
             neg_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[2]),axis=0)
-            #diff = pos_pair_dist - neg_pair_dist
-            pos_neg_dist = tf.reduce_sum(tf.maximum(pos_pair_dist - neg_pair_dist + margin,0.0))
-            return pos_neg_dist
+            
+            #check if there is no positive pairs in the batch
+            noPosPairs = tf.less(tf.shape(pos_pair_dist)[0],1)
+            #check if there is no negative pairs in the batch
+            noNegPairs = tf.less(tf.shape(neg_pair_dist)[1],1)
+            
+            def PosNegPairs(): return tf.maximum(pos_pair_dist + margin - neg_pair_dist,0.0)
+            def noPosPair(): return tf.maximum(margin - neg_pair_dist,0.0)
+            def noNegPair(): return tf.maximum(pos_pair_dist + margin,0.0)
+            pos_neg_dist = tf.case({noPosPairs:noPosPair, \
+                                    noNegPairs:noNegPair}, \
+                                   default=PosNegPairs,exclusive=True)
+            
+            return tf.reduce_sum(pos_neg_dist)
 
         def computeDistanceOfPosNegPairWithSoftplus(x):
             x[0].set_shape([None])
@@ -185,9 +201,20 @@ def batch_hard_loc(dists, pids, margin, batch_precision_at_k=None):
             x[2].set_shape([None])
             pos_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[1]),axis=1)
             neg_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[2]),axis=0)
-            #diff = pos_pair_dist - neg_pair_dist
-            pos_neg_dist = tf.reduce_sum(tf.nn.softplus(pos_pair_dist - neg_pair_dist ))
-            return pos_neg_dist
+
+            #check if there is no positive pairs in the batch
+            noPosPairs = tf.less(tf.shape(pos_pair_dist)[0],1)
+            #check if there is no negative pairs in the batch
+            noNegPairs = tf.less(tf.shape(neg_pair_dist)[1],1)
+            
+            def PosNegPairs(): return tf.nn.softplus(pos_pair_dist - neg_pair_dist)
+            def noPosPair():   return tf.nn.softplus(-neg_pair_dist)
+            def noNegPair():   return tf.nn.softplus(pos_pair_dist)
+            pos_neg_dist = tf.case({noPosPairs:noPosPair, \
+                                    noNegPairs:noNegPair}, \
+                                   default=PosNegPairs,exclusive=True)
+            #pos_neg_dist = tf.reduce_sum(tf.nn.softplus(pos_pair_dist - neg_pair_dist ))
+            return tf.reduce_sum(pos_neg_dist)
         
         if isinstance(margin, numbers.Real):
             diff = tf.map_fn(computeDistanceOfPosNegPairWithMargin,(dists, positive_mask, negative_mask), tf.float32)
@@ -195,7 +222,7 @@ def batch_hard_loc(dists, pids, margin, batch_precision_at_k=None):
             diff = tf.map_fn(computeDistanceOfPosNegPairWithSoftplus,(dists, positive_mask, negative_mask), tf.float32)
         else:
             raise NotImplementedError(
-                    'The margin {} is not implemented in batch_hard'.format(margin))
+                    'The margin {} is not implemented in normalTriplet'.format(margin))
 
 
     if batch_precision_at_k is None:
@@ -238,13 +265,35 @@ def batch_hard_loc(dists, pids, margin, batch_precision_at_k=None):
 
         return diff, top1, prec_at_k, topk_is_same, negative_dists, positive_dists
 
-def tripletLoss(embeddingFeature,label,margin=-0.5, metric='euclidean'):
+def tripletLoss(embeddingFeature,label,margin=-0.5, metric='euclidean',tripletType='normal'):
+    """
+    Author: lochappy<ttanloc@gmail.com>
+    rgs:
+        embeddingFeature (2D tensor): Embedding feature vector, shape(B,numfeatures)
+        label (1D tensor): The identities of the entries in `batch`, shape (B,).
+            This can be of any type that can be compared, thus also a string.
+        margin: The value of the margin if a number, alternatively the string
+            'soft' for using the soft-margin formulation, or `None` for not
+            using a margin at all.
+        metric (string): Which distance metric to use. The currently supported metrics are:
+                            - 'euclidean', although with a fudge-factor epsilon.
+                            - 'sqeuclidean', the squared euclidean.
+                            - 'cityblock', the manhattan or L1 distance.
+        tripletType (string):which type of triplet loss is used. The currently supported losses
+                            are: normal and batch_hard
+
+    Returns:
+        A scalar which is the mean loss value of all samples.
+    """
     # Create the loss in two steps:
     # 1. Compute all pairwise distances according to the specified metric.
     # 2. For each anchor along the first dimension, compute its loss.
     with tf.name_scope('triplet_loss'):
         dists = cdist(embeddingFeature, embeddingFeature, metric=metric)
-        losses = batch_hard_loc(dists, label, margin)
+        if tripletType == 'normal':
+            losses = normalTriplet(dists, label, margin)
+        elif tripletType == 'batch_hard':
+            losses = batch_hard(dists, label, margin)
         losses = tf.reduce_mean(losses)
 
     return losses

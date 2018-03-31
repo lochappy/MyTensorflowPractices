@@ -186,12 +186,13 @@ def normalTriplet(dists, pids, margin, batch_precision_at_k=None):
             #check if there is no negative pairs in the batch
             noNegPairs = tf.less(tf.shape(neg_pair_dist)[1],1)
             
-            def PosNegPairs(): return tf.maximum(pos_pair_dist + margin - neg_pair_dist,0.0)
-            def noPosPair(): return tf.maximum(margin - neg_pair_dist,0.0)
-            def noNegPair(): return tf.maximum(pos_pair_dist + margin,0.0)
+            def PosNegPairs(): return tf.reshape(pos_pair_dist - neg_pair_dist,shape=[-1])
+            def noPosPair(): return  tf.reshape(-neg_pair_dist,shape=[-1])
+            def noNegPair(): return tf.reshape(pos_pair_dist,shape=[-1])
             pos_neg_dist = tf.case({noPosPairs:noPosPair, \
                                     noNegPairs:noNegPair}, \
                                    default=PosNegPairs,exclusive=True)
+            pos_neg_dist = tf.maximum(pos_neg_dist+margin,0.0)
             
             return tf.reduce_sum(pos_neg_dist)
 
@@ -207,12 +208,14 @@ def normalTriplet(dists, pids, margin, batch_precision_at_k=None):
             #check if there is no negative pairs in the batch
             noNegPairs = tf.less(tf.shape(neg_pair_dist)[1],1)
             
-            def PosNegPairs(): return tf.nn.softplus(pos_pair_dist - neg_pair_dist)
-            def noPosPair():   return tf.nn.softplus(-neg_pair_dist)
-            def noNegPair():   return tf.nn.softplus(pos_pair_dist)
+            def PosNegPairs(): return tf.reshape(pos_pair_dist - neg_pair_dist,shape=[-1])
+            def noPosPair(): return  tf.reshape(-neg_pair_dist,shape=[-1])
+            def noNegPair(): return tf.reshape(pos_pair_dist,shape=[-1])
             pos_neg_dist = tf.case({noPosPairs:noPosPair, \
                                     noNegPairs:noNegPair}, \
                                    default=PosNegPairs,exclusive=True)
+            pos_neg_dist = tf.nn.softplus(pos_neg_dist)
+            
             #pos_neg_dist = tf.reduce_sum(tf.nn.softplus(pos_pair_dist - neg_pair_dist ))
             return tf.reduce_sum(pos_neg_dist)
         
@@ -264,8 +267,130 @@ def normalTriplet(dists, pids, margin, batch_precision_at_k=None):
         positive_dists = tf.boolean_mask(dists, positive_mask)
 
         return diff, top1, prec_at_k, topk_is_same, negative_dists, positive_dists
+ 
 
-def tripletLoss(embeddingFeature,label,margin=-0.5, metric='euclidean',tripletType='normal'):
+def adaptive_weight_sampling(dists, pids, margin, batch_precision_at_k=None):
+    """
+    Author: lochappy <ttanloc@gmail.com>
+    Computes adaptive weight loss https://arxiv.org/pdf/1803.10859.pdf.
+
+    Args:
+        dists (2D tensor): A square all-to-all distance matrix as given by cdist.
+        pids (1D tensor): The identities of the entries in `batch`, shape (B,).
+            This can be of any type that can be compared, thus also a string.
+        margin: The value of the margin if a number, alternatively the string
+            'soft' for using the soft-margin formulation, or `None` for not
+            using a margin at all.
+
+    Returns:
+        A 1D tensor of shape (B,) containing the loss value for each sample.
+    """
+    with tf.name_scope("normalTriplet"):
+        same_identity_mask = tf.equal(tf.expand_dims(pids, axis=1),
+                                      tf.expand_dims(pids, axis=0))
+        negative_mask = tf.logical_not(same_identity_mask)
+        positive_mask = tf.logical_xor(same_identity_mask,
+                                       tf.eye(tf.shape(pids)[0], dtype=tf.bool))
+        
+        def computeDistanceOfPosNegPairWithMargin(x):
+            x[0].set_shape([None])
+            x[1].set_shape([None])
+            x[2].set_shape([None])
+            pos_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[1]),axis=1)
+            neg_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[2]),axis=0)
+            
+            #check if there is no positive pairs in the batch
+            noPosPairs = tf.less(tf.shape(pos_pair_dist)[0],1)
+            #check if there is no negative pairs in the batch
+            noNegPairs = tf.less(tf.shape(neg_pair_dist)[1],1)
+            
+            def PosNegPairs(): return tf.reshape( tf.multiply(tf.nn.softmax(pos_pair_dist),pos_pair_dist) \
+                                                 - tf.multiply(tf.nn.softmax(-neg_pair_dist),neg_pair_dist), \
+                                                   shape=[-1])
+            def noPosPair(): return  tf.reshape(- tf.multiply(tf.nn.softmax(-neg_pair_dist),neg_pair_dist),shape=[-1])
+            def noNegPair(): return tf.reshape(tf.multiply(tf.nn.softmax(pos_pair_dist),pos_pair_dist),shape=[-1])
+            
+            pos_neg_dist = tf.case({noPosPairs:noPosPair, \
+                                    noNegPairs:noNegPair}, \
+                                   default=PosNegPairs,exclusive=True)
+            
+            pos_neg_dist = tf.maximum(pos_neg_dist+margin,0.0)
+            return tf.reduce_sum(pos_neg_dist)
+
+        def computeDistanceOfPosNegPairWithSoftplus(x):
+            x[0].set_shape([None])
+            x[1].set_shape([None])
+            x[2].set_shape([None])
+            pos_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[1]),axis=1)
+            neg_pair_dist = tf.expand_dims(tf.boolean_mask(x[0], x[2]),axis=0)
+
+            #check if there is no positive pairs in the batch
+            noPosPairs = tf.less(tf.shape(pos_pair_dist)[0],1)
+            #check if there is no negative pairs in the batch
+            noNegPairs = tf.less(tf.shape(neg_pair_dist)[1],1)
+            
+            def PosNegPairs(): return tf.reshape( tf.multiply(tf.nn.softmax(pos_pair_dist),pos_pair_dist) \
+                                                 - tf.multiply(tf.nn.softmax(-neg_pair_dist),neg_pair_dist), \
+                                                   shape=[-1])
+            def noPosPair(): return  tf.reshape(- tf.multiply(tf.nn.softmax(-neg_pair_dist),neg_pair_dist),shape=[-1])
+            def noNegPair(): return tf.reshape(tf.multiply(tf.nn.softmax(pos_pair_dist),pos_pair_dist),shape=[-1])
+            pos_neg_dist = tf.case({noPosPairs:noPosPair, \
+                                    noNegPairs:noNegPair}, \
+                                   default=PosNegPairs,exclusive=True)
+            
+            pos_neg_dist = tf.nn.softplus(pos_neg_dist)
+            return tf.reduce_sum(pos_neg_dist)
+        
+        if isinstance(margin, numbers.Real):
+            diff = tf.map_fn(computeDistanceOfPosNegPairWithMargin,(dists, positive_mask, negative_mask), tf.float32)
+        elif margin == 'soft':
+            diff = tf.map_fn(computeDistanceOfPosNegPairWithSoftplus,(dists, positive_mask, negative_mask), tf.float32)
+        else:
+            raise NotImplementedError(
+                    'The margin {} is not implemented in normalTriplet'.format(margin))
+
+
+    if batch_precision_at_k is None:
+        return diff
+
+    # For monitoring, compute the within-batch top-1 accuracy and the
+    # within-batch precision-at-k, which is somewhat more expressive.
+    with tf.name_scope("monitoring"):
+        # This is like argsort along the last axis. Add one to K as we'll
+        # drop the diagonal.
+        _, indices = tf.nn.top_k(-dists, k=batch_precision_at_k+1)
+
+        # Drop the diagonal (distance to self is always least).
+        indices = indices[:,1:]
+
+        # Generate the index indexing into the batch dimension.
+        # This is simething like [[0,0,0],[1,1,1],...,[B,B,B]]
+        batch_index = tf.tile(
+            tf.expand_dims(tf.range(tf.shape(indices)[0]), 1),
+            (1, tf.shape(indices)[1]))
+
+        # Stitch the above together with the argsort indices to get the
+        # indices of the top-k of each row.
+        topk_indices = tf.stack((batch_index, indices), -1)
+
+        # See if the topk belong to the same person as they should, or not.
+        topk_is_same = tf.gather_nd(same_identity_mask, topk_indices)
+
+        # All of the above could be reduced to the simpler following if k==1
+        #top1_is_same = get_at_indices(same_identity_mask, top_idxs[:,1])
+
+        topk_is_same_f32 = tf.cast(topk_is_same, tf.float32)
+        top1 = tf.reduce_mean(topk_is_same_f32[:,0])
+        prec_at_k = tf.reduce_mean(topk_is_same_f32)
+
+        # Finally, let's get some more info that can help in debugging while
+        # we're at it!
+        negative_dists = tf.boolean_mask(dists, negative_mask)
+        positive_dists = tf.boolean_mask(dists, positive_mask)
+
+        return diff, top1, prec_at_k, topk_is_same, negative_dists, positive_dists
+
+def tripletLoss(embeddingFeature,label,margin=0.5, metric='euclidean',tripletType='normal'):
     """
     Author: lochappy<ttanloc@gmail.com>
     rgs:
@@ -294,6 +419,8 @@ def tripletLoss(embeddingFeature,label,margin=-0.5, metric='euclidean',tripletTy
             losses = normalTriplet(dists, label, margin)
         elif tripletType == 'batch_hard':
             losses = batch_hard(dists, label, margin)
+        elif tripletType == 'adaptive_weight':
+            losses = adaptive_weight_sampling(dists, label, margin)
         losses = tf.reduce_mean(losses)
 
     return losses
